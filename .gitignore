@@ -43,3 +43,5 @@ release/
 # Misc
 .DS_Store
 Thumbs.db
+
+src/dllmain.cpp.bak-*
