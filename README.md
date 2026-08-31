@@ -1,4 +1,4 @@
-﻿# These Aren't the Heads You're Looking For
+# These Aren't the Heads You're Looking For
 
 A somewhat janky character customization expansion for **Star Wars Zero Company**.
 
@@ -89,30 +89,37 @@ Other UE4SS versions may work, but haven't been tested by me.
 
 ## Installation
 
+### Manual installation
+
 Install UE4SS for Star Wars Zero Company first.
 
-Then place the mod here:
+Then extract the mod archive into:
 
-    SWZeroCompany\Binaries\Win64\ue4ss\Mods\TheseArentTheHeadsYoureLookingFor\
+    Star Wars Zero Company\SWZeroCompany\Binaries\Win64\
 
 The final structure should be:
 
-    ue4ss
-    └─ Mods
-       └─ TheseArentTheHeadsYoureLookingFor
-          └─ dlls
-             └─ main.dll
+    SWZeroCompany
+    └─ Binaries
+       └─ Win64
+          └─ ue4ss
+             └─ Mods
+                └─ TheseArentTheHeadsYoureLookingFor
+                   ├─ enabled.txt
+                   └─ dlls
+                      └─ main.dll
 
-Then add this line to:
+The included `enabled.txt` tells UE4SS to load the mod automatically.
 
-    SWZeroCompany\Binaries\Win64\ue4ss\Mods\mods.txt
-
-Add:
-
-    TheseArentTheHeadsYoureLookingFor : 1
+**You do not need to edit `mods.txt`.**
 
 Launch the game normally.
 
+### Vortex
+
+The archive also uses the standard UE4SS folder structure and includes `enabled.txt`.
+
+Vortex installation may work with the Star Wars Zero Company Vortex extension, but manual installation remains the known working method.
 ## Compatibility
 
 The mod changes character customization behaviour at runtime through UE4SS.

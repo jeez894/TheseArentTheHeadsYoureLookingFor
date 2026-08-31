@@ -1,4 +1,4 @@
-﻿# Building from source
+# Building from source
 
 This document describes the build setup currently used for **These Aren't the Heads You're Looking For**.
 
@@ -61,19 +61,17 @@ Create the following UE4SS mod structure:
     ue4ss
     └─ Mods
        └─ TheseArentTheHeadsYoureLookingFor
+          ├─ enabled.txt
           └─ dlls
              └─ main.dll
 
-Then add this line to UE4SS's `Mods\mods.txt`:
-
-    TheseArentTheHeadsYoureLookingFor : 1
+`enabled.txt` can be an empty file. Its presence enables the mod through UE4SS without requiring an entry in `mods.txt`.
 
 Launch Star Wars Zero Company normally.
 
 A successful load should produce a UE4SS log entry similar to:
 
     Starting C++ mod 'TheseArentTheHeadsYoureLookingFor'
-
 ## Notes
 
 The first build can take significantly longer because RE-UE4SS and its dependencies are compiled as part of the build tree.
