@@ -19,7 +19,6 @@
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/UObject.hpp>
-#include <Unreal/UObjectArray.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/FPrimaryAssetId.hpp>
 #include <Unreal/NameTypes.hpp>
@@ -263,12 +262,6 @@ namespace
 
     std::array<std::atomic_bool, kTargetSpecs.size()> g_seen_catalogue{};
     std::array<std::atomic_bool, kTargetSpecs.size()> g_pending_catalogue{};
-
-    // Visual wake-up flags are declared here because the customization hooks
-    // fire before the visual subsystem definitions later in this file.
-    extern std::atomic_bool g_visual_dirty;
-    extern std::atomic_bool g_visual_rebuild_event;
-    extern std::atomic_bool g_visual_listener_armed;
 
     auto bytes_match(std::uintptr_t base,
                      std::uintptr_t image_size,
@@ -573,16 +566,6 @@ namespace
         // cross-species compatibility without us injecting them manually.
         original(subsystem, owned_tags, output);
 
-        // This function is already the game's central customization catalogue
-        // refresh path (and is cooperatively chained behind ZCUnlocked). Use it
-        // as a zero-cost event source for the visual layer instead of polling
-        // every frame forever. The UObject creation listener below stays armed
-        // around these refreshes and wakes us again as the replacement proxy /
-        // Face.Mesh objects are actually constructed.
-        g_visual_dirty.store(
-            true, std::memory_order_release);
-        g_visual_rebuild_event.store(
-            true, std::memory_order_release);
         if (!owned_tags || !output)
         {
             return;
@@ -684,29 +667,14 @@ namespace
         1.0,
     };
 
-    // Hook-window visual scheduler.
-    //
-    // IMPORTANT: there is deliberately NO global FUObjectCreateListener here.
-    // Zero Company creates thousands of unrelated UObjects during menu work; a
-    // global listener therefore generated thousands of callbacks for no useful
-    // reason.  The existing customization catalogue hook is our wake-up source.
-    // It opens a short fixed retry window so a replacement preview proxy that is
-    // constructed a few frames later is still caught, then scanning stops again.
-    // A slow safety scan remains for map transitions / missed refreshes.
-    constexpr auto kVisualRebuildRetryPeriod =
-        std::chrono::milliseconds{33};
-    constexpr auto kVisualRebuildRetryWindow =
-        std::chrono::milliseconds{2500};
-    constexpr auto kVisualMaterialRetryPeriod =
-        std::chrono::milliseconds{125};
-    constexpr auto kVisualMaterialRetryWindow =
-        std::chrono::seconds{3};
-    constexpr auto kVisualListenerHoldWindow =
-        std::chrono::seconds{2};
-    constexpr auto kVisualSafetyFallbackPeriod =
-        std::chrono::seconds{5};
+    constexpr auto kAstroVisualScanPeriodIdle =
+        std::chrono::milliseconds{250};
+    constexpr auto kAstroVisualScanPeriodFast =
+        std::chrono::milliseconds{0};
+    constexpr auto kAstroVisualFastWindow =
+        std::chrono::seconds{30};
     constexpr auto kTransientVisualGapGrace =
-        std::chrono::milliseconds{1500};
+        std::chrono::milliseconds{750};
 
     enum class VisualOwnerKind
     {
@@ -731,37 +699,13 @@ namespace
         std::chrono::steady_clock::time_point last_seen{};
         bool seen_this_scan{};
         bool active{};
-        bool awaiting_materials{};
     };
-
-    struct AstroMountOffsetCache
-    {
-        UObject* mesh{};
-        FVector56 relative_location{};
-    };
-
-    std::vector<AstroMountOffsetCache> g_astro_mount_offsets{};
 
     std::vector<VisualMountState> g_visual_mounts{};
     UObject* g_stable_visual_clone_host{};
     UClass* g_skeletal_mesh_component_class{};
-
-    std::atomic_bool g_visual_dirty{true};
-    std::atomic_bool g_visual_rebuild_event{true};
-    std::atomic_bool g_visual_listener_armed{true};
-    std::atomic_bool g_visual_listener_registered{false};
-    std::atomic_uint32_t g_visual_create_events{0};
-
-    std::chrono::steady_clock::time_point g_visual_listener_hold_until{};
-    std::chrono::steady_clock::time_point g_visual_rebuild_retry_until{};
-    std::chrono::steady_clock::time_point g_visual_material_retry_until{};
-    std::chrono::steady_clock::time_point g_next_visual_rebuild_retry{};
-    std::chrono::steady_clock::time_point g_next_visual_material_retry{};
-    std::chrono::steady_clock::time_point g_next_visual_fallback{};
-
-    bool g_visual_rebuild_retry_pending{};
-    bool g_visual_material_retry_pending{};
-    bool g_visual_context_active{};
+    std::chrono::steady_clock::time_point g_next_visual_scan{};
+    std::chrono::steady_clock::time_point g_fast_visual_scan_until{};
     bool g_native_visual_mount_ready{false};
 
     auto is_live_object(UObject* object) -> bool
@@ -891,73 +835,6 @@ namespace
 
         out = *value;
         return true;
-    }
-
-    auto get_vector_property(UObject* object,
-                              const RC::Unreal::TCHAR* property_name,
-                              FVector56& out) -> bool
-    {
-        if (!is_live_object(object))
-        {
-            return false;
-        }
-
-        auto* value =
-            object->GetValuePtrByPropertyNameInChain<FVector56>(
-                property_name);
-
-        if (value == nullptr)
-        {
-            return false;
-        }
-
-        out = *value;
-        return true;
-    }
-
-    auto find_cached_mount_offset(UObject* mesh)
-        -> const FVector56*
-    {
-        if (!is_live_object(mesh))
-        {
-            return nullptr;
-        }
-
-        for (const auto& cached : g_astro_mount_offsets)
-        {
-            if (cached.mesh == mesh)
-            {
-                return &cached.relative_location;
-            }
-        }
-
-        return nullptr;
-    }
-
-    auto remember_mount_offset(UObject* mesh,
-                               const FVector56& relative_location)
-        -> void
-    {
-        if (!is_live_object(mesh))
-        {
-            return;
-        }
-
-        for (auto& cached : g_astro_mount_offsets)
-        {
-            if (cached.mesh == mesh)
-            {
-                cached.relative_location =
-                    relative_location;
-                return;
-            }
-        }
-
-        g_astro_mount_offsets.push_back(
-            AstroMountOffsetCache{
-                .mesh = mesh,
-                .relative_location = relative_location,
-            });
     }
 
     auto is_character_mesh_parent(UObject* component) -> bool
@@ -1666,43 +1543,6 @@ namespace
         return true;
     }
 
-    auto set_relative_location(UObject* component,
-                               const FVector56& location) -> bool
-    {
-        auto* function =
-            find_function(component,
-                          STR("K2_SetRelativeLocation"));
-
-        if (function == nullptr)
-        {
-            return false;
-        }
-
-        ReflectedCall call{function};
-
-        const bool no_sweep = false;
-        const bool teleport = true;
-
-        if (!set_input(function,
-                       call.data(),
-                       0,
-                       location) ||
-            !set_input(function,
-                       call.data(),
-                       1,
-                       no_sweep) ||
-            !set_input(function,
-                       call.data(),
-                       2,
-                       teleport))
-        {
-            return false;
-        }
-
-        component->ProcessEvent(function, call.data());
-        return true;
-    }
-
     auto set_relative_rotation(UObject* component,
                                const FRotator56& rotation) -> bool
     {
@@ -1966,100 +1806,6 @@ namespace
                names_equal(actual, expected_socket);
     }
 
-    auto mount_clone_from_cached_offset(
-        VisualMountState& state,
-        UObject* source,
-        UObject* parent,
-        UObject* mesh,
-        VisualOwnerKind kind) -> bool
-    {
-        if (!uses_persistent_visual_role(kind) ||
-            !is_live_object(source) ||
-            !is_live_object(parent) ||
-            !is_live_object(mesh) ||
-            !is_live_object(state.clone))
-        {
-            return false;
-        }
-
-        const auto* cached_location =
-            find_cached_mount_offset(mesh);
-
-        if (cached_location == nullptr)
-        {
-            return false;
-        }
-
-        const bool mesh_changed =
-            state.mesh != mesh;
-
-        if ((mesh_changed || !state.active) &&
-            !set_skeletal_mesh(state.clone, mesh))
-        {
-            return false;
-        }
-
-        const auto material_count =
-            get_num_materials(source);
-
-        if (material_count > 0)
-        {
-            copy_materials(source, state.clone);
-        }
-
-        // Important: do NOT ask the new proxy whether neck_02 is queryable.
-        // During customizer rebuilds the socket name can be attached before
-        // the skeletal pose is ready. Unreal stores AttachSocketName and will
-        // resolve it as soon as CharacterMesh0 finishes initialization.
-        FName humanoid_neck{
-            STR("neck_02"),
-            RC::Unreal::FNAME_Find};
-
-        if (humanoid_neck.IsNone() ||
-            !attach_to_bone(
-                state.clone,
-                parent,
-                humanoid_neck) ||
-            !set_relative_rotation(
-                state.clone,
-                kAstroCloneRotation) ||
-            !set_relative_scale(
-                state.clone,
-                kAstroCloneScale) ||
-            !set_relative_location(
-                state.clone,
-                *cached_location))
-        {
-            return false;
-        }
-
-        set_collision_disabled(state.clone);
-        set_component_tick(state.clone, false);
-        set_component_visibility(state.clone, true);
-
-        // Never let the freshly-created managed Astromech head flash at its
-        // authored droid size. Keep it logically visible for the customization
-        // system but collapse it immediately.
-        set_component_visibility(source, true);
-        set_relative_scale(
-            source,
-            kAstroSuppressedSourceScale);
-
-        state.source = source;
-        state.mesh = mesh;
-        state.parent = parent;
-        state.active = true;
-        state.awaiting_materials =
-            material_count <= 0;
-
-        RC::Output::send<RC::LogLevel::Verbose>(
-            STR("[TheseArentTheHeadsYoureLookingFor] astro_fast_retarget owner={} materials={} cached_offset=true native_suppressed=true\n"),
-            visual_owner_label(kind),
-            material_count);
-
-        return true;
-    }
-
     auto mount_clone_once(VisualMountState& state,
                           UObject* source,
                           UObject* parent,
@@ -2076,15 +1822,7 @@ namespace
             return false;
         }
 
-        const bool mesh_changed =
-            state.mesh != mesh;
-
-        // On a persistent customizer role, a new proxy often arrives with the
-        // SAME Astromech mesh but with materials=0 for a few frames. Do not
-        // reset the stable clone's mesh in that case: keeping the mesh also
-        // keeps the last good material set while we retarget immediately.
-        if ((mesh_changed || !state.active) &&
-            !set_skeletal_mesh(state.clone, mesh))
+        if (!set_skeletal_mesh(state.clone, mesh))
         {
             RC::Output::send<RC::LogLevel::Error>(
                 STR("[TheseArentTheHeadsYoureLookingFor] astro_mount_failed owner={} reason=set-mesh\n"),
@@ -2093,12 +1831,7 @@ namespace
         }
 
         const auto material_count =
-            get_num_materials(source);
-
-        if (material_count > 0)
-        {
             copy_materials(source, state.clone);
-        }
 
         FName astro_head{};
         FName humanoid_neck{};
@@ -2106,21 +1839,14 @@ namespace
         if (!find_exact_bone(
                 state.clone,
                 STR("Head"),
-                astro_head))
-        {
-            RC::Output::send<RC::LogLevel::Error>(
-                STR("[TheseArentTheHeadsYoureLookingFor] astro_mount_failed owner={} reason=astro-head-bone-not-ready\n"),
-                visual_owner_label(kind));
-            return false;
-        }
-
-        if (!find_exact_bone(
+                astro_head) ||
+            !find_exact_bone(
                 parent,
                 STR("neck_02"),
                 humanoid_neck))
         {
             RC::Output::send<RC::LogLevel::Error>(
-                STR("[TheseArentTheHeadsYoureLookingFor] astro_mount_failed owner={} reason=humanoid-neck-bone-not-ready\n"),
+                STR("[TheseArentTheHeadsYoureLookingFor] astro_mount_failed owner={} reason=bone-not-found\n"),
                 visual_owner_label(kind));
             return false;
         }
@@ -2186,23 +1912,6 @@ namespace
             return false;
         }
 
-        // Cache the solved local offset by Astromech mesh. The customizer
-        // constantly destroys/recreates its proxy actor, but the humanoid
-        // neck socket and Astromech Head pivot are the same. Once one fully
-        // initialized actor (usually HERO) has solved the pivot, later proxy
-        // generations can be attached immediately without waiting for their
-        // skeletal pose/bone lookup to become queryable.
-        FVector56 solved_relative_location{};
-        if (get_vector_property(
-                state.clone,
-                STR("RelativeLocation"),
-                solved_relative_location))
-        {
-            remember_mount_offset(
-                mesh,
-                solved_relative_location);
-        }
-
         // Independent visual prop: no collision and no own animation tick.
         set_collision_disabled(state.clone);
         set_component_tick(state.clone, false);
@@ -2226,8 +1935,6 @@ namespace
         state.mesh = mesh;
         state.parent = parent;
         state.active = true;
-        state.awaiting_materials =
-            material_count <= 0;
 
         RC::Output::send<RC::LogLevel::Verbose>(
             STR("[TheseArentTheHeadsYoureLookingFor] astro_mount_ready owner={} reason={} materials={} rot=(-90,177.5,180) scale=0.60\n"),
@@ -2276,13 +1983,23 @@ namespace
                     old_name,
                     new_name);
 
-                // IMPORTANT: do not restore the old managed Face.Mesh here.
-                // The old proxy is disposable and may overlap the new one for
-                // a frame or two. Restoring it to scale 1.0 is exactly what
-                // caused the "large head flashes" during menu transitions.
-                // Keep the stable clone alive with its last good mesh/materials
-                // until the replacement target is ready enough to retarget.
+                // Restore the old managed source if it still exists. The
+                // independent clone survives; only its target changes.
+                if (is_live_object(state.source))
+                {
+                    set_component_visibility(
+                        state.source,
+                        true);
+                    set_relative_scale(
+                        state.source,
+                        kNativeFaceDefaultScale);
+                }
+
                 state.owner = owner;
+                state.source = nullptr;
+                state.mesh = nullptr;
+                state.parent = nullptr;
+                state.active = false;
             }
 
             state.kind = kind;
@@ -2342,21 +2059,12 @@ namespace
         bool astromech{};
     };
 
-    struct VisualScanOutcome
+    auto run_native_astromech_visual_scan() -> void
     {
-        bool transient_context{};
-        bool rebuild_retry{};
-        bool material_retry{};
-    };
-
-    auto run_native_astromech_visual_scan() -> VisualScanOutcome
-    {
-        VisualScanOutcome outcome{};
-
         if (!g_native_visual_mount_ready ||
             g_skeletal_mesh_component_class == nullptr)
         {
-            return outcome;
+            return;
         }
 
         const auto scan_now =
@@ -2396,26 +2104,8 @@ namespace
             const auto kind =
                 visual_owner_kind(owner);
 
-            if (kind != VisualOwnerKind::Hero &&
-                kind != VisualOwnerKind::Other)
-            {
-                outcome.transient_context = true;
-            }
-
             auto* mesh =
                 get_skeletal_mesh(component);
-
-            if (!is_live_object(mesh))
-            {
-                // A newly-created managed Face.Mesh may exist before its
-                // SkeletalMesh asset is assigned. That is not evidence that
-                // the player switched away from the Astromech head.
-                if (kind != VisualOwnerKind::Other)
-                {
-                    outcome.rebuild_retry = true;
-                }
-                continue;
-            }
 
             auto* parent =
                 get_object_property(
@@ -2424,12 +2114,6 @@ namespace
 
             if (!is_live_object(parent))
             {
-                // A freshly allocated Face.Mesh can exist before its parent is
-                // wired. Stay in the short event-driven retry burst.
-                if (kind != VisualOwnerKind::Other)
-                {
-                    outcome.rebuild_retry = true;
-                }
                 continue;
             }
 
@@ -2443,6 +2127,12 @@ namespace
 
             const bool astromech =
                 is_astromech_head_mesh(mesh);
+
+            if (kind != VisualOwnerKind::Hero)
+            {
+                g_fast_visual_scan_until =
+                    scan_now + kAstroVisualFastWindow;
+            }
 
             const bool persistent_role =
                 uses_persistent_visual_role(kind);
@@ -2566,7 +2256,6 @@ namespace
                 state.mesh = candidate.mesh;
                 state.parent = candidate.parent;
                 state.active = false;
-                state.awaiting_materials = false;
                 continue;
             }
 
@@ -2578,43 +2267,35 @@ namespace
             state.seen_this_scan = true;
             state.last_seen = scan_now;
 
-            // Geometry is useful BEFORE materials are ready. The previous
-            // stable-role-v2 deliberately waited at materials=0, which left
-            // the new native Astromech head at full size for several seconds.
-            // Retarget immediately; if materials are still pending, preserve
-            // the clone's last good material set and refresh them later.
+            // The transient Face.Mesh often exists several frames before it is
+            // actually ready. In the failing log CUSTOMIZER_PREVIEW mounted at
+            // materials=0, then only became complete later. Do not create or
+            // retarget the clone until the source is genuinely initialized.
             const auto source_materials =
                 get_num_materials(candidate.source);
 
             if (candidate.kind != VisualOwnerKind::Hero &&
-                source_materials <= 0 &&
-                state.source != candidate.source)
-            {
-                RC::Output::send<RC::LogLevel::Verbose>(
-                    STR("[TheseArentTheHeadsYoureLookingFor] astro_geometry_early owner={} owner_name={} source={} materials=0 action=retarget-now\n"),
-                    visual_owner_label(candidate.kind),
-                    candidate.owner->GetFullName(),
-                    candidate.source->GetFullName());
-            }
-
-            if (candidate.kind != VisualOwnerKind::Hero &&
                 source_materials <= 0)
             {
-                outcome.material_retry = true;
-            }
+                const bool new_pending_source =
+                    state.source != candidate.source;
 
-            if (uses_persistent_visual_role(
-                    candidate.kind))
-            {
-                // This is safe even before CharacterMesh0's skeleton is ready:
-                // scale/visibility belong to the managed Face.Mesh component
-                // itself and do not require any bone query.
-                set_component_visibility(
-                    candidate.source,
-                    true);
-                set_relative_scale(
-                    candidate.source,
-                    kAstroSuppressedSourceScale);
+                if (new_pending_source)
+                {
+                    RC::Output::send<RC::LogLevel::Verbose>(
+                        STR("[TheseArentTheHeadsYoureLookingFor] astro_waiting_ready owner={} owner_name={} source={} materials=0\n"),
+                        visual_owner_label(candidate.kind),
+                        candidate.owner->GetFullName(),
+                        candidate.source->GetFullName());
+                }
+
+                // Remember the pending generation so we log it once, but do
+                // not collapse it and do not move the stable clone yet.
+                state.owner = candidate.owner;
+                state.source = candidate.source;
+                state.mesh = candidate.mesh;
+                state.parent = candidate.parent;
+                continue;
             }
 
             UObject* clone_host =
@@ -2632,7 +2313,6 @@ namespace
                         STR("[TheseArentTheHeadsYoureLookingFor] astro_waiting_host owner={} owner_name={}\n"),
                         visual_owner_label(candidate.kind),
                         candidate.owner->GetFullName());
-                    outcome.rebuild_retry = true;
                     continue;
                 }
             }
@@ -2676,7 +2356,6 @@ namespace
                             kAstroCloneScale);
                     }
 
-                    outcome.rebuild_retry = true;
                     continue;
                 }
 
@@ -2691,8 +2370,7 @@ namespace
             // managed source before moving the logical role to the new proxy.
             if (state.source != candidate.source &&
                 is_live_object(state.source) &&
-                candidate.kind != VisualOwnerKind::Hero &&
-                !uses_persistent_visual_role(candidate.kind))
+                candidate.kind != VisualOwnerKind::Hero)
             {
                 set_component_visibility(
                     state.source,
@@ -2702,27 +2380,9 @@ namespace
                     kNativeFaceDefaultScale);
             }
 
-            if (source_materials > 0)
-            {
-                copy_materials(
-                    candidate.source,
-                    state.clone);
-
-                if (state.awaiting_materials)
-                {
-                    RC::Output::send<RC::LogLevel::Verbose>(
-                        STR("[TheseArentTheHeadsYoureLookingFor] astro_materials_ready owner={} materials={}\n"),
-                        visual_owner_label(candidate.kind),
-                        source_materials);
-                }
-
-                state.awaiting_materials = false;
-            }
-            else if (candidate.kind != VisualOwnerKind::Hero)
-            {
-                state.awaiting_materials = true;
-                outcome.material_retry = true;
-            }
+            copy_materials(
+                candidate.source,
+                state.clone);
 
             FName expected_socket{
                 STR("neck_02"),
@@ -2752,97 +2412,35 @@ namespace
 
             if (needs_remount)
             {
-                bool mounted = false;
-
-                if (uses_persistent_visual_role(
-                        candidate.kind))
-                {
-                    mounted =
-                        mount_clone_from_cached_offset(
-                            state,
-                            candidate.source,
-                            candidate.parent,
-                            candidate.mesh,
-                            candidate.kind);
-                }
+                const bool mounted =
+                    mount_clone_once(
+                        state,
+                        candidate.source,
+                        candidate.parent,
+                        candidate.mesh,
+                        candidate.kind,
+                        state.active
+                            ? STR("retarget")
+                            : STR("activate"));
 
                 if (!mounted)
                 {
-                    const bool had_previous_mount =
-                        state.active &&
-                        is_live_object(state.clone);
+                    set_component_visibility(
+                        state.clone,
+                        false);
 
-                    mounted =
-                        mount_clone_once(
-                            state,
-                            candidate.source,
-                            candidate.parent,
-                            candidate.mesh,
-                            candidate.kind,
-                            state.active
-                                ? STR("retarget")
-                                : STR("activate"));
+                    set_component_visibility(
+                        candidate.source,
+                        true);
 
-                    if (!mounted)
+                    if (candidate.kind != VisualOwnerKind::Hero)
                     {
-                        // The new proxy can expose Face.Mesh before
-                        // CharacterMesh0 exposes neck_02. Do NOT fall back to
-                        // the authored giant head and do NOT hide the previous
-                        // persistent clone. Keep the previous good visual alive
-                        // while retrying; the new managed source remains
-                        // collapsed to 0.001 from the moment we see it.
-                        const bool preserve_previous_clone =
-                            uses_persistent_visual_role(
-                                candidate.kind) &&
-                            had_previous_mount &&
-                            is_live_object(state.clone);
-
-                        if (preserve_previous_clone)
-                        {
-                            set_component_visibility(
-                                state.clone,
-                                true);
-                            set_component_visibility(
-                                candidate.source,
-                                true);
-                            set_relative_scale(
-                                candidate.source,
-                                kAstroSuppressedSourceScale);
-
-                            RC::Output::send<RC::LogLevel::Verbose>(
-                                STR("[TheseArentTheHeadsYoureLookingFor] astro_retarget_deferred owner={} keep_previous_clone=true native_suppressed=true\n"),
-                                visual_owner_label(candidate.kind));
-                        }
-                        else
-                        {
-                            set_component_visibility(
-                                state.clone,
-                                false);
-
-                            set_component_visibility(
-                                candidate.source,
-                                true);
-
-                            if (uses_persistent_visual_role(
-                                    candidate.kind))
-                            {
-                                set_relative_scale(
-                                    candidate.source,
-                                    kAstroSuppressedSourceScale);
-                            }
-                            else if (candidate.kind !=
-                                     VisualOwnerKind::Hero)
-                            {
-                                set_relative_scale(
-                                    candidate.source,
-                                    kAstroCloneScale);
-                            }
-
-                            state.active = false;
-                        }
-
-                        outcome.rebuild_retry = true;
+                        set_relative_scale(
+                            candidate.source,
+                            kAstroCloneScale);
                     }
+
+                    state.active = false;
                 }
             }
             else
@@ -2886,8 +2484,6 @@ namespace
                 scan_now - state.last_seen <
                     kTransientVisualGapGrace)
             {
-                outcome.transient_context = true;
-                outcome.rebuild_retry = true;
                 set_component_visibility(
                     state.clone,
                     true);
@@ -2916,7 +2512,6 @@ namespace
             }
 
             state.active = false;
-            state.awaiting_materials = false;
             state.source = nullptr;
             state.mesh = nullptr;
             state.parent = nullptr;
@@ -2938,46 +2533,7 @@ namespace
                            !is_live_object(state.clone);
                 }),
             g_visual_mounts.end());
-
-        return outcome;
     }
-
-    // Legacy listener implementation retained for ABI/source continuity only.
-    // hook-window-v5 NEVER registers it; the customization catalogue hook is
-    // the only normal wake-up source for visual rebuilds.
-    struct VisualUObjectCreateListener final
-        : public RC::Unreal::FUObjectCreateListener
-    {
-        void NotifyUObjectCreated(
-            const RC::Unreal::UObjectBase*,
-            std::int32_t) override
-        {
-            if (!g_visual_listener_armed.load(
-                    std::memory_order_acquire))
-            {
-                return;
-            }
-
-            g_visual_create_events.fetch_add(
-                1, std::memory_order_relaxed);
-            g_visual_dirty.store(
-                true, std::memory_order_release);
-            g_visual_rebuild_event.store(
-                true, std::memory_order_release);
-        }
-
-        void OnUObjectArrayShutdown() override
-        {
-            if (g_visual_listener_registered.exchange(
-                    false, std::memory_order_acq_rel))
-            {
-                RC::Unreal::UObjectArray::
-                    RemoveUObjectCreateListener(this);
-            }
-        }
-    };
-
-    VisualUObjectCreateListener g_visual_object_create_listener{};
 
     auto install_customization_hooks() -> bool
     {
@@ -3054,7 +2610,7 @@ namespace
         TheseArentTheHeadsYoureLookingForMod()
         {
             ModName = STR("TheseArentTheHeadsYoureLookingFor");
-            ModVersion = STR("0.1.3-hook-window-test");
+            ModVersion = STR("0.1.1-compat-test");
             ModDescription =
                 STR("Expanded heads + Astromech support + cooperative customization hooks");
             ModAuthors = STR("Guillaume Rouge (jeez894)");
@@ -3062,14 +2618,6 @@ namespace
 
         ~TheseArentTheHeadsYoureLookingForMod() override
         {
-            if (g_visual_listener_registered.exchange(
-                    false, std::memory_order_acq_rel))
-            {
-                RC::Unreal::UObjectArray::
-                    RemoveUObjectCreateListener(
-                        &g_visual_object_create_listener);
-            }
-
             if (g_filter_hook)
             {
                 g_filter_hook->unHook();
@@ -3162,33 +2710,8 @@ namespace
             g_native_visual_mount_ready =
                 g_skeletal_mesh_component_class != nullptr;
 
-            const auto visual_now =
+            g_next_visual_scan =
                 std::chrono::steady_clock::now();
-
-            g_visual_listener_hold_until = visual_now;
-            g_visual_rebuild_retry_until =
-                visual_now + kVisualRebuildRetryWindow;
-            g_visual_material_retry_until =
-                visual_now + kVisualMaterialRetryWindow;
-            g_next_visual_rebuild_retry =
-                visual_now;
-            g_next_visual_material_retry =
-                visual_now;
-            g_next_visual_fallback =
-                visual_now + kVisualSafetyFallbackPeriod;
-
-            g_visual_dirty.store(
-                true, std::memory_order_release);
-            g_visual_rebuild_event.store(
-                true, std::memory_order_release);
-            g_visual_listener_armed.store(
-                false, std::memory_order_release);
-
-            if (g_native_visual_mount_ready)
-            {
-                RC::Output::send<RC::LogLevel::Verbose>(
-                    STR("[TheseArentTheHeadsYoureLookingFor] visual_scheduler=hook-window-v5 global_uobject_listener=false retry_ms=33 window_ms=2500\n"));
-            }
 
             if (!g_native_visual_mount_ready)
             {
@@ -3225,7 +2748,7 @@ namespace
                     if (install_customization_hooks())
                     {
                         RC::Output::send<RC::LogLevel::Verbose>(
-                            STR("[TheseArentTheHeadsYoureLookingFor] READY face_targets=96 astromech_heads=39 native_astromech_mount={} customizer_mount={} cross_species_relaxation={} found_species_tags={} cooperative_hooks=true visual_arch=hook-window-v5\n"),
+                            STR("[TheseArentTheHeadsYoureLookingFor] READY face_targets=96 astromech_heads=39 native_astromech_mount={} customizer_mount={} cross_species_relaxation={} found_species_tags={} cooperative_hooks=true visual_arch=stable-role-v2\n"),
                             g_native_visual_mount_ready,
                             g_native_visual_mount_ready,
                             kEnableCrossSpeciesRequirementRelaxation,
@@ -3250,75 +2773,16 @@ namespace
                 const auto now =
                     std::chrono::steady_clock::now();
 
-                if (g_visual_rebuild_event.exchange(
-                        false, std::memory_order_acq_rel))
+                if (now >= g_next_visual_scan)
                 {
-                    // This is a retry WINDOW, not a delay: the first scan still
-                    // happens immediately below. The window only keeps us
-                    // checking for a few frames if the replacement proxy is
-                    // half-constructed when the event arrives.
-                    g_visual_listener_hold_until = now;
-                    g_visual_rebuild_retry_until =
-                        now + kVisualRebuildRetryWindow;
-                    g_visual_material_retry_until =
-                        now + kVisualMaterialRetryWindow;
-                    g_visual_rebuild_retry_pending = true;
-                    g_next_visual_rebuild_retry = now;
-                }
+                    const auto period =
+                        now < g_fast_visual_scan_until
+                            ? kAstroVisualScanPeriodFast
+                            : kAstroVisualScanPeriodIdle;
 
-                const bool dirty =
-                    g_visual_dirty.exchange(
-                        false, std::memory_order_acq_rel);
+                    g_next_visual_scan = now + period;
 
-                const bool rebuild_retry_due =
-                    g_visual_rebuild_retry_pending &&
-                    now < g_visual_rebuild_retry_until &&
-                    now >= g_next_visual_rebuild_retry;
-
-                const bool material_retry_due =
-                    g_visual_material_retry_pending &&
-                    now < g_visual_material_retry_until &&
-                    now >= g_next_visual_material_retry;
-
-                const bool safety_fallback_due =
-                    now >= g_next_visual_fallback;
-
-                if (dirty ||
-                    rebuild_retry_due ||
-                    material_retry_due ||
-                    safety_fallback_due)
-                {
-                    const auto create_events =
-                        g_visual_create_events.exchange(
-                            0, std::memory_order_acq_rel);
-
-                    const auto outcome =
-                        run_native_astromech_visual_scan();
-
-                    g_visual_context_active =
-                        outcome.transient_context;
-
-                    g_visual_rebuild_retry_pending =
-                        now < g_visual_rebuild_retry_until;
-
-                    g_visual_material_retry_pending =
-                        outcome.material_retry &&
-                        now < g_visual_material_retry_until;
-
-                    g_next_visual_rebuild_retry =
-                        now + kVisualRebuildRetryPeriod;
-                    g_next_visual_material_retry =
-                        now + kVisualMaterialRetryPeriod;
-                    g_next_visual_fallback =
-                        now + kVisualSafetyFallbackPeriod;
-
-                    // v5 intentionally never arms the global UObject create
-                    // listener.  The catalogue hook + this bounded retry window
-                    // are sufficient and avoid thousands of irrelevant callbacks.
-                    g_visual_listener_armed.store(
-                        false, std::memory_order_release);
-
-                    (void)create_events;
+                    run_native_astromech_visual_scan();
                 }
             }
         }

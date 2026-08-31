@@ -583,6 +583,9 @@ namespace
             true, std::memory_order_release);
         g_visual_rebuild_event.store(
             true, std::memory_order_release);
+        g_visual_listener_armed.store(
+            true, std::memory_order_release);
+
         if (!owned_tags || !output)
         {
             return;
@@ -684,19 +687,19 @@ namespace
         1.0,
     };
 
-    // Hook-window visual scheduler.
+    // Event-driven visual scheduler.
     //
-    // IMPORTANT: there is deliberately NO global FUObjectCreateListener here.
-    // Zero Company creates thousands of unrelated UObjects during menu work; a
-    // global listener therefore generated thousands of callbacks for no useful
-    // reason.  The existing customization catalogue hook is our wake-up source.
-    // It opens a short fixed retry window so a replacement preview proxy that is
-    // constructed a few frames later is still caught, then scanning stops again.
-    // A slow safety scan remains for map transitions / missed refreshes.
+    // We do NOT continuously scan GUObjectArray. A customization catalogue
+    // refresh arms the listener immediately; UObject creation notifications
+    // then mark the visual state dirty. on_update consumes that dirty flag on
+    // the game thread. Short retries are only used while a newly-created proxy
+    // is still being assembled. A very slow 5 s safety scan remains only
+    // to recover from missed engine events / map transitions; there is no
+    // per-frame idle polling.
     constexpr auto kVisualRebuildRetryPeriod =
         std::chrono::milliseconds{33};
     constexpr auto kVisualRebuildRetryWindow =
-        std::chrono::milliseconds{2500};
+        std::chrono::seconds{4};
     constexpr auto kVisualMaterialRetryPeriod =
         std::chrono::milliseconds{125};
     constexpr auto kVisualMaterialRetryWindow =
@@ -2942,9 +2945,10 @@ namespace
         return outcome;
     }
 
-    // Legacy listener implementation retained for ABI/source continuity only.
-    // hook-window-v5 NEVER registers it; the customization catalogue hook is
-    // the only normal wake-up source for visual rebuilds.
+    // Unreal's UObject-array listener is used only as a wake-up source. The
+    // callback does no reflection, object traversal or component writes because
+    // NotifyUObjectCreated can fire before the object is fully constructed.
+    // Actual work is deferred to on_update on the game thread.
     struct VisualUObjectCreateListener final
         : public RC::Unreal::FUObjectCreateListener
     {
@@ -3054,7 +3058,7 @@ namespace
         TheseArentTheHeadsYoureLookingForMod()
         {
             ModName = STR("TheseArentTheHeadsYoureLookingFor");
-            ModVersion = STR("0.1.3-hook-window-test");
+            ModVersion = STR("0.1.2-event-dirty-test");
             ModDescription =
                 STR("Expanded heads + Astromech support + cooperative customization hooks");
             ModAuthors = STR("Guillaume Rouge (jeez894)");
@@ -3165,7 +3169,8 @@ namespace
             const auto visual_now =
                 std::chrono::steady_clock::now();
 
-            g_visual_listener_hold_until = visual_now;
+            g_visual_listener_hold_until =
+                visual_now + kVisualListenerHoldWindow;
             g_visual_rebuild_retry_until =
                 visual_now + kVisualRebuildRetryWindow;
             g_visual_material_retry_until =
@@ -3182,12 +3187,18 @@ namespace
             g_visual_rebuild_event.store(
                 true, std::memory_order_release);
             g_visual_listener_armed.store(
-                false, std::memory_order_release);
+                true, std::memory_order_release);
 
             if (g_native_visual_mount_ready)
             {
+                RC::Unreal::UObjectArray::
+                    AddUObjectCreateListener(
+                        &g_visual_object_create_listener);
+                g_visual_listener_registered.store(
+                    true, std::memory_order_release);
+
                 RC::Output::send<RC::LogLevel::Verbose>(
-                    STR("[TheseArentTheHeadsYoureLookingFor] visual_scheduler=hook-window-v5 global_uobject_listener=false retry_ms=33 window_ms=2500\n"));
+                    STR("[TheseArentTheHeadsYoureLookingFor] visual_listener_registered type=FUObjectCreateListener scheduler=event-dirty-v4-cache\n"));
             }
 
             if (!g_native_visual_mount_ready)
@@ -3225,7 +3236,7 @@ namespace
                     if (install_customization_hooks())
                     {
                         RC::Output::send<RC::LogLevel::Verbose>(
-                            STR("[TheseArentTheHeadsYoureLookingFor] READY face_targets=96 astromech_heads=39 native_astromech_mount={} customizer_mount={} cross_species_relaxation={} found_species_tags={} cooperative_hooks=true visual_arch=hook-window-v5\n"),
+                            STR("[TheseArentTheHeadsYoureLookingFor] READY face_targets=96 astromech_heads=39 native_astromech_mount={} customizer_mount={} cross_species_relaxation={} found_species_tags={} cooperative_hooks=true visual_arch=event-dirty-v4-cache\n"),
                             g_native_visual_mount_ready,
                             g_native_visual_mount_ready,
                             kEnableCrossSpeciesRequirementRelaxation,
@@ -3257,13 +3268,16 @@ namespace
                     // happens immediately below. The window only keeps us
                     // checking for a few frames if the replacement proxy is
                     // half-constructed when the event arrives.
-                    g_visual_listener_hold_until = now;
+                    g_visual_listener_hold_until =
+                        now + kVisualListenerHoldWindow;
                     g_visual_rebuild_retry_until =
                         now + kVisualRebuildRetryWindow;
                     g_visual_material_retry_until =
                         now + kVisualMaterialRetryWindow;
                     g_visual_rebuild_retry_pending = true;
                     g_next_visual_rebuild_retry = now;
+                    g_visual_listener_armed.store(
+                        true, std::memory_order_release);
                 }
 
                 const bool dirty =
@@ -3299,6 +3313,7 @@ namespace
                         outcome.transient_context;
 
                     g_visual_rebuild_retry_pending =
+                        outcome.rebuild_retry &&
                         now < g_visual_rebuild_retry_until;
 
                     g_visual_material_retry_pending =
@@ -3312,13 +3327,32 @@ namespace
                     g_next_visual_fallback =
                         now + kVisualSafetyFallbackPeriod;
 
-                    // v5 intentionally never arms the global UObject create
-                    // listener.  The catalogue hook + this bounded retry window
-                    // are sufficient and avoid thousands of irrelevant callbacks.
+                    const bool keep_listener_armed =
+                        g_visual_rebuild_retry_pending ||
+                        g_visual_material_retry_pending ||
+                        now < g_visual_listener_hold_until;
+
+                    g_visual_listener_armed.store(
+                        keep_listener_armed,
+                        std::memory_order_release);
+
+                    if (create_events > 0 &&
+                        (outcome.rebuild_retry ||
+                         outcome.material_retry))
+                    {
+                        RC::Output::send<RC::LogLevel::Verbose>(
+                            STR("[TheseArentTheHeadsYoureLookingFor] visual_event_scan create_events={} rebuild_retry={} material_retry={} context={}\n"),
+                            create_events,
+                            outcome.rebuild_retry,
+                            outcome.material_retry,
+                            outcome.transient_context);
+                    }
+                }
+                else if (!g_visual_context_active &&
+                         now >= g_visual_listener_hold_until)
+                {
                     g_visual_listener_armed.store(
                         false, std::memory_order_release);
-
-                    (void)create_events;
                 }
             }
         }
