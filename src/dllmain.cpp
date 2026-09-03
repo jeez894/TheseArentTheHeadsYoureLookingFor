@@ -3423,6 +3423,20 @@ namespace
 
     std::vector<VisualMountState> g_visual_mounts{};
 
+    // EXP20D.2: remember ONLY material IDs that this mod hid on an allowed
+    // player/customizer Face.Mesh component. This lets a reused component
+    // restore our own stale bits before a different head mesh is evaluated,
+    // without ever rewriting unrelated material visibility.
+    struct NpcFaceSectionMaskState
+    {
+        UObject* component{};
+        UObject* mesh{};
+        std::vector<std::int32_t> hidden_material_ids{};
+    };
+
+    std::vector<NpcFaceSectionMaskState> g_npc_face_section_masks{};
+    std::vector<UObject*> g_npc_face_scope_skip_logged{};
+
     // EXP20 CLEAN no-scan discovery: managed Humanoid Face.Mesh components are
     // captured once when Unreal creates them. on_update only revisits these
     // pointers; there is no FindAllOf(SkeletalMeshComponent) anywhere.
@@ -4710,6 +4724,19 @@ namespace
         }
     }
 
+    auto is_mc_face_cleanup_owner(VisualOwnerKind kind) -> bool
+    {
+        // Only the playable Hero and the known character-creator/portrait
+        // proxies are allowed to receive embedded Hair/Eyebrow section edits.
+        // World NPCs classify as Other; generic PreviewActor is deliberately
+        // excluded as well.
+        return kind == VisualOwnerKind::Hero ||
+               kind == VisualOwnerKind::Customizer ||
+               kind == VisualOwnerKind::CustomizerPreview ||
+               kind == VisualOwnerKind::Portrait ||
+               kind == VisualOwnerKind::StoryCustomizer;
+    }
+
     auto uses_persistent_visual_role(VisualOwnerKind) -> bool
     {
         // EXP20 CLEAN clones stay owned by the same actor as their Face.Mesh source.
@@ -5401,27 +5428,6 @@ namespace
         return true;
     }
 
-    auto get_num_lods(UObject* component) -> std::int32_t
-    {
-        std::int32_t result{};
-
-        if (!call_return_int(component,
-                             STR("GetNumLODs"),
-                             result))
-        {
-            return 1;
-        }
-
-        if (result <= 0)
-        {
-            return 1;
-        }
-
-        // More than eight LODs on a face would be extremely unusual. Bound
-        // reflected calls even if a malformed component reports nonsense.
-        return std::min<std::int32_t>(result, 8);
-    }
-
     auto is_embedded_hair_material(UObject* material) -> bool
     {
         if (!is_live_object(material))
@@ -5460,17 +5466,147 @@ namespace
                string_contains(name, STR("_brow"));
     }
 
+    auto find_npc_face_section_mask_state(UObject* component)
+        -> NpcFaceSectionMaskState*
+    {
+        for (auto& state : g_npc_face_section_masks)
+        {
+            if (state.component == component)
+            {
+                return &state;
+            }
+        }
+
+        return nullptr;
+    }
+
+    auto find_or_create_npc_face_section_mask_state(UObject* component)
+        -> NpcFaceSectionMaskState&
+    {
+        if (auto* state = find_npc_face_section_mask_state(component);
+            state != nullptr)
+        {
+            return *state;
+        }
+
+        g_npc_face_section_masks.push_back(
+            NpcFaceSectionMaskState{
+                .component = component,
+            });
+
+        return g_npc_face_section_masks.back();
+    }
+
+    auto restore_our_npc_face_section_bits(
+        NpcFaceSectionMaskState& state) -> std::int32_t
+    {
+        if (!is_live_object(state.component) ||
+            state.hidden_material_ids.empty())
+        {
+            state.hidden_material_ids.clear();
+            return 0;
+        }
+
+        std::int32_t restored = 0;
+
+        for (const auto material_id : state.hidden_material_ids)
+        {
+            if (show_material_section(
+                    state.component,
+                    material_id,
+                    true,
+                    0))
+            {
+                ++restored;
+            }
+        }
+
+        state.hidden_material_ids.clear();
+        return restored;
+    }
+
+    auto log_npc_face_scope_skip_once(
+        UObject* component,
+        UObject* mesh,
+        VisualOwnerKind kind) -> void
+    {
+        if (!is_live_object(component))
+        {
+            return;
+        }
+
+        if (std::find(
+                g_npc_face_scope_skip_logged.begin(),
+                g_npc_face_scope_skip_logged.end(),
+                component) != g_npc_face_scope_skip_logged.end())
+        {
+            return;
+        }
+
+        // Audit dedupe for already event-captured Face.Mesh pointers only.
+        // It does not discover/enumerate UObjects, actors, components or world.
+        g_npc_face_scope_skip_logged.push_back(component);
+
+        RC::Output::send<RC::LogLevel::Verbose>(
+            STR("[TheseArentTheHeadsYoureLookingFor] npc_face_section_scope_skip owner={} owner_scope=non-mc action=no-ShowMaterialSection component={} mesh={} mc_only=true lod=0 findallof=false world_enum=false\n"),
+            visual_owner_label(kind),
+            component->GetFullName(),
+            mesh->GetFullName());
+    }
+
     // Return -1 while materials are not ready, 0 for a normal face with no
     // embedded hair/brow sections, or the number of hidden material sections.
-    // This inspects only one already event-captured Face.Mesh component.
+    // EXP20D.2 is deliberately surgical:
+    //   * only known MC/customizer/portrait owners are eligible;
+    //   * Other + PreviewActor receive ZERO ShowMaterialSection calls;
+    //   * only Hair/Eyebrow material IDs are ever hidden;
+    //   * only LOD0 is touched (the material-ID layout we actually know);
+    //   * when a component is reused, only IDs previously hidden by this mod
+    //     are restored to visible. Unrelated Eyes/Head/Teeth/etc. are never
+    //     rewritten.
     auto apply_embedded_npc_face_section_policy(
         UObject* component,
-        UObject* mesh) -> std::int32_t
+        UObject* mesh,
+        VisualOwnerKind owner_kind) -> std::int32_t
     {
         if (!is_live_object(component) ||
             !is_live_object(mesh))
         {
             return 0;
+        }
+
+        if (!is_mc_face_cleanup_owner(owner_kind))
+        {
+            log_npc_face_scope_skip_once(
+                component,
+                mesh,
+                owner_kind);
+            return 0;
+        }
+
+        auto* previous_state =
+            find_npc_face_section_mask_state(component);
+
+        // If this exact Face.Mesh component switched to another SkeletalMesh,
+        // clear ONLY visibility bits previously set by us. Do it before waiting
+        // for the new material list so a stale material ID cannot temporarily
+        // hide an Eye/Head/etc. section on the replacement.
+        if (previous_state != nullptr &&
+            previous_state->mesh != mesh)
+        {
+            const auto restored =
+                restore_our_npc_face_section_bits(*previous_state);
+
+            if (restored > 0)
+            {
+                RC::Output::send<RC::LogLevel::Verbose>(
+                    STR("[TheseArentTheHeadsYoureLookingFor] npc_face_embedded_sections_restore owner={} component={} restored={} policy=own-bits-only lod=0 unrelated_materials_untouched=true\n"),
+                    visual_owner_label(owner_kind),
+                    component->GetFullName(),
+                    restored);
+            }
+
+            previous_state->mesh = mesh;
         }
 
         const auto material_count =
@@ -5481,11 +5617,7 @@ namespace
             return -1;
         }
 
-        std::vector<bool> hide_material{};
-        hide_material.resize(
-            static_cast<std::size_t>(material_count),
-            false);
-
+        std::vector<std::int32_t> target_material_ids{};
         std::int32_t hair_count = 0;
         std::int32_t eyebrow_count = 0;
 
@@ -5505,51 +5637,57 @@ namespace
                 continue;
             }
 
-            hide_material[static_cast<std::size_t>(index)] = true;
+            target_material_ids.push_back(index);
             hair_count += hair ? 1 : 0;
             eyebrow_count += eyebrow ? 1 : 0;
         }
 
-        const auto hidden_count =
-            hair_count + eyebrow_count;
-
-        if (hidden_count <= 0)
+        if (previous_state != nullptr &&
+            previous_state->mesh == mesh &&
+            previous_state->hidden_material_ids != target_material_ids)
         {
+            (void)restore_our_npc_face_section_bits(*previous_state);
+        }
+
+        if (target_material_ids.empty())
+        {
+            if (previous_state != nullptr)
+            {
+                previous_state->mesh = mesh;
+            }
             return 0;
         }
 
-        const auto lod_count = get_num_lods(component);
+        auto& state =
+            find_or_create_npc_face_section_mask_state(component);
+        state.mesh = mesh;
 
-        // A reused Face.Mesh component can retain per-material hidden bits.
-        // Because this branch is entered only after finding an embedded
-        // Hair/Eyebrow material in the CURRENT head, explicitly show every
-        // non-target material and hide only the target IDs on every live LOD.
-        for (std::int32_t lod = 0;
-             lod < lod_count;
-             ++lod)
+        std::int32_t hidden_count = 0;
+
+        // Never loop over non-target material IDs. Eyes, EyeAO, Eyelashes,
+        // Head, Teeth, Fluid, etc. receive no visibility write here.
+        for (const auto material_id : target_material_ids)
         {
-            for (std::int32_t material_id = 0;
-                 material_id < material_count;
-                 ++material_id)
-            {
-                const bool show =
-                    !hide_material[static_cast<std::size_t>(material_id)];
-
-                (void)show_material_section(
+            if (show_material_section(
                     component,
                     material_id,
-                    show,
-                    lod);
+                    false,
+                    0))
+            {
+                ++hidden_count;
             }
         }
 
+        state.hidden_material_ids = target_material_ids;
+
         RC::Output::send<RC::LogLevel::Verbose>(
-            STR("[TheseArentTheHeadsYoureLookingFor] npc_face_embedded_sections mesh={} hair_hidden={} eyebrow_hidden={} materials={} lods={} method=ShowMaterialSection section_index=-1 source=event-captured-Face.Mesh findallof=false world_enum=false\n"),
+            STR("[TheseArentTheHeadsYoureLookingFor] npc_face_embedded_sections owner={} mesh={} hair_hidden={} eyebrow_hidden={} hidden_calls={} materials={} lod=0 policy=hair-eyebrow-only mc_only=true unrelated_materials_untouched=true source=event-captured-Face.Mesh findallof=false world_enum=false\n"),
+            visual_owner_label(owner_kind),
             mesh->GetFullName(),
             hair_count,
             eyebrow_count,
-            material_count,
-            lod_count);
+            hidden_count,
+            material_count);
 
         return hidden_count;
     }
@@ -6727,7 +6865,8 @@ namespace
                 const auto npc_section_result =
                     apply_embedded_npc_face_section_policy(
                         candidate.source,
-                        candidate.mesh);
+                        candidate.mesh,
+                        candidate.kind);
 
                 if (npc_section_result < 0 &&
                     candidate.kind != VisualOwnerKind::Other)
@@ -7325,7 +7464,7 @@ namespace
         return outcome;
     }
 
-    // EXP20D event-capture instead of object-array enumeration.
+    // EXP20D.2 event-capture instead of object-array enumeration.
     struct VisualUObjectCreateListener final
         : public RC::Unreal::FUObjectCreateListener
     {
@@ -7481,9 +7620,9 @@ namespace
         TheseArentTheHeadsYoureLookingForMod()
         {
             ModName = STR("TheseArentTheHeadsYoureLookingFor");
-            ModVersion = STR("0.3.0-exp20d-static-npc-section-clean");
+            ModVersion = STR("0.3.0-exp20d2-static-npc-mc-section-guard");
             ModDescription =
-                STR("Static Appearance + direct Astromech clone from exact mesh table, no component scan");
+                STR("Static Appearance + exact CPD IDs + MC-only NPC section cleanup + direct Astromech clone, no component scan");
             ModAuthors = STR("Guillaume Rouge (jeez894)");
         }
 
@@ -7918,7 +8057,7 @@ namespace
                     if (install_customization_hooks())
                     {
                         RC::Output::send<RC::LogLevel::Verbose>(
-                            STR("[TheseArentTheHeadsYoureLookingFor] READY face_targets=74 astromech_heads=17 astromech_paint_cpds=22 astromech_paint_slots=3 astro_paint_graft=exact-root-preload-head-root-hoist astro_head_instance=direct-independent direct_head_instance=true appearance_manifest=822 static_catalogue_entries=624 hair_choices=71 facial_choices=27 hidden_species=5 excluded_clothing=11 face_clean=44 eyebrow_clean=2 scar_clean=12 eyes_routed=34 eye_route=contextual-anchor hair_graft_policy=Zabrak-only-owned-copy-one-shot hair_arch_force=6 dev_face_patch=exact-4 dev_hair_unhide=true dev_facial_unhide=true dev_invalid_guard_strip=true helmet_requirement_bypass=observed-candidate helmet_catalogue_bridge=anchor-driven togruta_tattoo_bridge=local-cross-slot native_astromech_mount={} customizer_mount={} static_exact_ids=true face_npc_policy=compiled-head-cpd-plus-hair-eyebrow-unlock learned_catalogue=false broad_species_retry=false exact_crossrace_force=true skintone_force=false cooperative_hooks=true owned_tags_overlay=false persistent_instance_tag_mutation=false visual_arch=event-captured-face-pointers-no-findallof creator_arch=static-manifest-v20c-npc-face-clean\n"),
+                            STR("[TheseArentTheHeadsYoureLookingFor] READY face_targets=74 astromech_heads=17 astromech_paint_cpds=22 astromech_paint_slots=3 astro_paint_graft=exact-root-preload-head-root-hoist astro_head_instance=direct-independent direct_head_instance=true appearance_manifest=822 static_catalogue_entries=624 hair_choices=71 facial_choices=27 hidden_species=5 excluded_clothing=11 face_clean=44 eyebrow_clean=2 scar_clean=12 eyes_routed=34 eye_route=contextual-anchor hair_graft_policy=Zabrak-only-owned-copy-one-shot hair_arch_force=6 dev_face_patch=exact-4 dev_hair_unhide=true dev_facial_unhide=true dev_invalid_guard_strip=true helmet_requirement_bypass=observed-candidate helmet_catalogue_bridge=anchor-driven togruta_tattoo_bridge=local-cross-slot native_astromech_mount={} customizer_mount={} static_exact_ids=true face_npc_policy=compiled-head-cpd-plus-hair-eyebrow-unlock learned_catalogue=false broad_species_retry=false exact_crossrace_force=true skintone_force=false cooperative_hooks=true owned_tags_overlay=false persistent_instance_tag_mutation=false visual_arch=event-captured-face-pointers-no-findallof creator_arch=static-manifest-v20d2-mc-section-guard npc_render_scope=mc-only npc_section_lod=0 npc_unrelated_material_writes=false exact_face_id_aliases=false\n"),
                             g_native_visual_mount_ready,
                             g_native_visual_mount_ready);
                     }
@@ -7988,7 +8127,7 @@ namespace
 
 
 
-            // EXP20D: bounded exact-ID NPC face sanitation. The source list is
+            // EXP20D.2: bounded exact-ID NPC face sanitation retained from EXP20D. The source list is
             // the compile-time TargetSpec policy; no UObject/world/component scan.
             const auto npc_face_sanitize_now =
                 std::chrono::steady_clock::now();
